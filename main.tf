@@ -1,29 +1,37 @@
-// Provider configuration
-terraform {
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 3.0"
-    }
+# Data sources
+data "aws_vpc" "main" {
+  id = var.vpc_id
+}
+
+data "aws_subnet" "selected" {
+  for_each = toset(var.subnet_ids)
+  id       = each.value
+}
+
+data "aws_security_group" "selected" {
+  for_each = toset(var.security_group_ids)
+  id       = each.value
+}
+
+data "aws_ami" "amazon_linux2" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
   }
 }
 
-provider "aws" {
-  region = "us-east-1"
-}
-
-data "aws_vpc" "main" {
-  id = "your-vpc-id"    #You may use variables here
-}
-
+# Launch Template
 resource "aws_launch_template" "demolt" {
-  name          = "demolt"
-  image_id      = "your-ami-id"  #You may use variables here
-  instance_type = "t2.micro"
-  key_name      = "kp"
+  name          = "${local.project_name}-lt"
+  image_id      = data.aws_ami.amazon_linux2.id
+  instance_type = var.instance_type
+  key_name      = var.key_name
 
   network_interfaces {
-    security_groups = ["LT-security-group-id"]   #You may use variables here
+    security_groups = var.security_group_ids
   }
 
   block_device_mappings {
@@ -35,43 +43,54 @@ resource "aws_launch_template" "demolt" {
   }
 
   iam_instance_profile {
-    name = "ec2-ssm"
+    name = var.iam_instance_profile
   }
 
   tag_specifications {
     resource_type = "instance"
-    tags = {
-      Name = "ltdemo"
-    }
+    tags = merge(local.common_tags, {
+      Name = "${local.project_name}-instance"
+    })
   }
 }
 
+# Auto Scaling Group
 resource "aws_autoscaling_group" "demoasg" {
-  name                  = "demoasg"
-  min_size              = 2
-  desired_capacity      = 2
-  max_size              = 3
-  vpc_zone_identifier   = ["subnet-id-1", "subnet-id-2"]  #You may use variables here
+  name                = "${local.project_name}-asg"
+  min_size            = var.asg_min_size
+  desired_capacity    = var.asg_desired_capacity
+  max_size            = var.asg_max_size
+  vpc_zone_identifier = var.subnet_ids
 
   launch_template {
     id      = aws_launch_template.demolt.id
     version = "$Latest"
   }
+
+  tags = [
+    {
+      key                 = "Name"
+      value               = "${local.project_name}-asg"
+      propagate_at_launch = true
+    }
+  ]
 }
 
+# ALB
 resource "aws_lb" "alb" {
-  name               = "alb"
+  name               = "${local.project_name}-alb"
   internal           = false
   load_balancer_type = "application"
-  security_groups    = ["alb-security-group-id"]    #You may use variables here
-  subnets           = ["subnet-id-1", "subnet-id-2"]    #You may use variables here
+  security_groups    = var.security_group_ids
+  subnets            = var.subnet_ids
+  tags               = local.common_tags
 }
 
 resource "aws_lb_target_group" "lt_ag" {
-  name       = "lt-ag"
-  port       = 80
-  protocol   = "HTTP"
-  vpc_id     = data.aws_vpc.main.id
+  name        = "${local.project_name}-tg"
+  port        = 80
+  protocol    = "HTTP"
+  vpc_id      = data.aws_vpc.main.id
   target_type = "instance"
 }
 
@@ -91,36 +110,40 @@ resource "aws_autoscaling_attachment" "asg_attachment" {
   alb_target_group_arn   = aws_lb_target_group.lt_ag.arn
 }
 
+# Scaling Policy
 resource "aws_autoscaling_policy" "scale_up" {
-  name                   = "sp"
+  name                   = "${local.project_name}-scaleup"
   scaling_adjustment     = 1
   adjustment_type        = "ChangeInCapacity"
-  cooldown              = 300
+  cooldown               = 300
   autoscaling_group_name = aws_autoscaling_group.demoasg.name
 }
 
+# CloudWatch Alarm
 resource "aws_cloudwatch_metric_alarm" "cpuutilization_alarm" {
-  alarm_name          = "cpuutilization_alarm"
+  alarm_name          = "${local.project_name}-cpu-alarm"
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = 1
   metric_name         = "CPUUtilization"
-  namespace          = "AWS/EC2"
-  period             = 60
-  statistic          = "Average"
-  threshold          = 40
-  alarm_actions      = [aws_autoscaling_policy.scale_up.arn, aws_sns_topic.cpu.arn]
+  namespace           = "AWS/EC2"
+  period              = 60
+  statistic           = "Average"
+  threshold           = var.alarm_threshold
+  alarm_actions       = [aws_autoscaling_policy.scale_up.arn, aws_sns_topic.cpu.arn]
+
   dimensions = {
     AutoScalingGroupName = aws_autoscaling_group.demoasg.name
   }
 }
 
+# SNS
 resource "aws_sns_topic" "cpu" {
-  name         = "cpu"
-  display_name = "cpu"
+  name         = "${local.project_name}-cpu-topic"
+  display_name = "CPU Utilization Alert"
 }
 
 resource "aws_sns_topic_subscription" "email_subscription" {
   topic_arn = aws_sns_topic.cpu.arn
   protocol  = "email-json"
-  endpoint  = "your-email-id"   #You may use variables here
+  endpoint  = var.notification_email
 }
